@@ -1,14 +1,16 @@
 """
-Archive Search — Streamlit App (Chunked, Low-Memory)
-=====================================================
-Loads the archive in 4 chunks and only reads the chunk(s)
-that match the first letter of the query. Keeps RAM under
-~300 MB, comfortably below the 1 GB free-tier limit.
+Archive Search — Streamlit App (All Features)
+==============================================
+Chunked loading, click-to-expand, date filter, author filter,
+score filter, phrase search, CSV export, Reddit links, copy
+buttons, parent post display, recent searches, URL params.
 """
 
 from __future__ import annotations
 
 import html
+import io
+import json
 import os
 import re
 from datetime import datetime, timezone
@@ -26,8 +28,8 @@ HF_FILENAME = "repladies_clean.parquet"
 HF_REPO_TYPE = "dataset"
 
 RESULTS_PER_PAGE = 25
-MAX_MATCHES = 5000        # hard cap on matching rows held in memory
-MAX_BODY_PREVIEW = 500
+MAX_MATCHES = 5000
+MAX_BODY_PREVIEW = 400
 MIN_QUERY_LENGTH = 2
 
 # ============================================================
@@ -67,14 +69,16 @@ st.markdown(
         border-color: #ff4500;
         box-shadow: 0 0 0 2px rgba(255, 69, 0, 0.2);
     }
+
     .result-card {
         background-color: #161b22;
         border: 1px solid #30363d;
         border-radius: 10px;
         padding: 16px 18px;
-        margin-bottom: 14px;
+        margin-bottom: 8px;
     }
     .result-card:hover { border-color: #ff4500; }
+
     .result-meta {
         font-size: 13px;
         color: #8b949e;
@@ -82,9 +86,12 @@ st.markdown(
         display: flex;
         flex-wrap: wrap;
         gap: 8px;
+        align-items: center;
     }
     .result-meta .author { color: #58a6ff; font-weight: 600; }
     .result-meta .upvotes { color: #ff4500; font-weight: 600; }
+    .result-meta a { color: #58a6ff; text-decoration: none; }
+
     .badge-post {
         display: inline-block;
         background: #ff4500;
@@ -123,6 +130,12 @@ st.markdown(
         text-decoration: none;
         border-bottom: 1px dotted #58a6ff;
     }
+    .parent-ref {
+        font-size: 12px;
+        color: #6e7681;
+        font-style: italic;
+        margin-bottom: 6px;
+    }
     mark {
         background: #ff4500;
         color: #fff;
@@ -155,13 +168,24 @@ st.markdown(
         color: #ff4500;
         font-weight: 700;
     }
+    .chip {
+        display: inline-block;
+        background: #161b22;
+        border: 1px solid #30363d;
+        color: #c9d1d9;
+        border-radius: 999px;
+        padding: 4px 12px;
+        font-size: 13px;
+        margin: 2px;
+        cursor: pointer;
+    }
 </style>
 """,
     unsafe_allow_html=True,
 )
 
 # ============================================================
-# Static stats (avoid loading full df just for counts)
+# Static stats
 # ============================================================
 TOTAL_RECORDS = 1_986_244
 TOTAL_POSTS = 62_722
@@ -225,53 +249,16 @@ def truncate(text: str, limit: int = MAX_BODY_PREVIEW) -> str:
     return text[:limit].rsplit(" ", 1)[0] + "…"
 
 
-def render_card(row, query: str) -> str:
-    is_post = row.get("type") == "post"
-    badge = (
-        '<span class="badge-post">POST</span>'
-        if is_post
-        else '<span class="badge-comment">COMMENT</span>'
-    )
-    author = escape_html(row.get("author", "unknown"))
-    score = int(row.get("score", 0) or 0)
-    date_str = format_date(row.get("created_utc", 0))
-
-    title_raw = str(row.get("title", "")).strip()
-    title_html = ""
-    if title_raw:
-        title_html = f'<div class="result-title">{highlight(linkify(escape_html(title_raw)), query)}</div>'
-
-    body_raw = truncate(str(row.get("body", "")).strip())
-    body_html = ""
-    if body_raw:
-        body_html = f'<div class="result-body">{highlight(linkify(escape_html(body_raw)), query)}</div>'
-
-    return f"""
-    <div class="result-card">
-        <div class="result-meta">
-            {badge}
-            <span>by <span class="author">u/{author}</span></span>
-            <span>· {date_str}</span>
-            <span>· <span class="upvotes">▲ {score}</span></span>
-        </div>
-        {title_html}
-        {body_html}
-    </div>
-    """
-
-
 # ============================================================
 # Download parquet once, split into 4 chunks on disk
 # ============================================================
 CHUNK_DIR = "/tmp/repladies_chunks"
 
+
 @st.cache_resource(show_spinner=False)
 def prepare_chunks() -> list[str]:
-    """Download the parquet and split into 4 row-groups on disk.
-    Returns list of chunk file paths."""
     os.makedirs(CHUNK_DIR, exist_ok=True)
 
-    # Check if already prepared
     existing = sorted(
         os.path.join(CHUNK_DIR, f)
         for f in os.listdir(CHUNK_DIR)
@@ -280,14 +267,12 @@ def prepare_chunks() -> list[str]:
     if len(existing) == 4:
         return existing
 
-    # Download
     path = hf_hub_download(
         repo_id=HF_REPO_ID,
         filename=HF_FILENAME,
         repo_type=HF_REPO_TYPE,
     )
 
-    # Split into 4 chunks by row index
     pf = pq.ParquetFile(path)
     total_rows = pf.metadata.num_rows
     rows_per_chunk = (total_rows + 3) // 4
@@ -296,13 +281,10 @@ def prepare_chunks() -> list[str]:
     for i in range(4):
         start = i * rows_per_chunk
         end = min(start + rows_per_chunk, total_rows)
-        chunk = pf.read_row_group(
-            0, columns=["type", "author", "created_utc", "score", "body", "title"]
-        ) if False else None
-        # Fallback: read full table sliced
+
         table = pq.read_table(
             path,
-            columns=["type", "author", "created_utc", "score", "body", "title"],
+            columns=["id", "type", "author", "created_utc", "score", "body", "title", "link_id"],
         ).slice(start, end - start)
 
         chunk_path = os.path.join(CHUNK_DIR, f"chunk_{i}.parquet")
@@ -313,39 +295,42 @@ def prepare_chunks() -> list[str]:
 
 
 # ============================================================
-# Search in chunks
+# Search
 # ============================================================
-def search_in_chunks(query: str, chunk_paths: list[str]) -> pd.DataFrame:
-    """Scan chunk files for query, return up to MAX_MATCHES rows."""
+def search_in_chunks(query: str, chunk_paths: list[str], phrase_mode: bool) -> pd.DataFrame:
     q_lower = query.lower()
     matches = []
     total_found = 0
 
     for chunk_path in chunk_paths:
-        # Load only needed columns
         df = pd.read_parquet(
             chunk_path,
-            columns=["type", "author", "created_utc", "score", "body", "title"],
+            columns=["id", "type", "author", "created_utc", "score", "body", "title", "link_id"],
         )
 
-        # Compact dtypes
         df["type"] = df["type"].astype("category")
         df["score"] = df["score"].fillna(0).astype("int32")
         df["created_utc"] = df["created_utc"].fillna(0).astype("int64")
 
-        # Lazy lower match
-        mask = (
-            df["body"].str.lower().str.contains(q_lower, regex=False, na=False)
-            | df["title"].str.lower().str.contains(q_lower, regex=False, na=False)
-        )
-        chunk_matches = df[mask]
+        body_lower = df["body"].str.lower()
+        title_lower = df["title"].str.lower()
 
+        if phrase_mode:
+            mask = body_lower.str.contains(q_lower, regex=False, na=False) | \
+                   title_lower.str.contains(q_lower, regex=False, na=False)
+        else:
+            terms = [t for t in re.split(r"\s+", q_lower) if len(t) >= 2]
+            mask = pd.Series([True] * len(df))
+            for term in terms:
+                mask &= (body_lower.str.contains(term, regex=False, na=False) |
+                         title_lower.str.contains(term, regex=False, na=False))
+
+        chunk_matches = df[mask]
         total_found += len(chunk_matches)
 
         if len(chunk_matches) > 0:
             matches.append(chunk_matches)
 
-        # Stop early if we have enough
         if total_found >= MAX_MATCHES:
             break
 
@@ -374,8 +359,18 @@ st.caption(f"A searchable snapshot of {TOTAL_RECORDS:,} historical records.")
 # ============================================================
 with st.sidebar:
     st.markdown("### 🎛️ Filters")
+
     include_posts = st.checkbox("Include posts", value=True)
     include_comments = st.checkbox("Include comments", value=True)
+
+    phrase_mode = st.checkbox("Exact phrase match", value=False)
+
+    min_score = st.slider("Minimum score", 0, 500, 0, step=5)
+
+    st.markdown("**Year range**")
+    year_range = st.slider("Year", 2016, 2023, (2016, 2023), step=1)
+
+    author_filter = st.text_input("Author (optional)", placeholder="e.g. silkandfeather")
 
     sort_mode = st.radio(
         "Sort by",
@@ -400,8 +395,17 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
 
+    if "recent_searches" not in st.session_state:
+        st.session_state.recent_searches = []
+
+    if st.session_state.recent_searches:
+        st.markdown("---")
+        st.markdown("### 🕘 Recent")
+        for q_old in st.session_state.recent_searches[-5:]:
+            st.markdown(f'<span class="chip">{escape_html(q_old)}</span>', unsafe_allow_html=True)
+
 # ============================================================
-# Prepare chunks (once)
+# Prepare chunks
 # ============================================================
 with st.spinner("Preparing archive chunks… (first load only)"):
     try:
@@ -424,8 +428,12 @@ if not query or len(query.strip()) < MIN_QUERY_LENGTH:
     st.info("👆 Type at least **2 characters** in the search bar to begin.")
     st.stop()
 
+if query not in st.session_state.recent_searches:
+    st.session_state.recent_searches.append(query)
+    st.session_state.recent_searches = st.session_state.recent_searches[-5:]
+
 with st.spinner("Searching…"):
-    results = search_in_chunks(query.strip(), chunk_paths)
+    results = search_in_chunks(query.strip(), chunk_paths, phrase_mode)
 
 if len(results) == 0:
     st.warning(f"No results for **{query}**.")
@@ -436,6 +444,21 @@ if not include_posts:
     results = results[results["type"] != "post"]
 if not include_comments:
     results = results[results["type"] != "comment"]
+if min_score > 0:
+    results = results[results["score"] >= min_score]
+
+if year_range:
+    year_lo, year_hi = year_range
+    try:
+        dt = pd.to_datetime(results["created_utc"], unit="s", errors="coerce")
+        year = dt.dt.year
+        results = results[(year >= year_lo) & (year <= year_hi)]
+    except Exception:
+        pass
+
+if author_filter.strip():
+    af = author_filter.strip().lower().lstrip("u/")
+    results = results[results["author"].str.lower().str.contains(af, regex=False, na=False)]
 
 # Sort
 if sort_mode == "Top scored":
@@ -447,10 +470,31 @@ else:
 
 total_results = len(results)
 
-st.markdown(f"### {total_results:,} result{'s' if total_results != 1 else ''} for **{escape_html(query)}**")
-if total_results >= MAX_MATCHES:
-    st.caption(f"⚠️ Showing first {MAX_MATCHES:,} matches (capped for memory). Refine your search for more specific results.")
+if total_results == 0:
+    st.warning("No results after applying filters. Try widening them.")
+    st.stop()
 
+# ============================================================
+# Results header + CSV
+# ============================================================
+col_left, col_right = st.columns([3, 1])
+with col_left:
+    st.markdown(f"### {total_results:,} result{'s' if total_results != 1 else ''} for **{escape_html(query)}**")
+    if total_results >= MAX_MATCHES:
+        st.caption(f"⚠️ Showing first {MAX_MATCHES:,} matches. Refine your search for more precise results.")
+with col_right:
+    csv_bytes = results.head(1000).to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "⬇️ Download 1,000 as CSV",
+        data=csv_bytes,
+        file_name=f"archive_{re.sub(r'[^a-zA-Z0-9]+', '_', query)[:40]}.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+# ============================================================
+# Pagination
+# ============================================================
 total_pages = max(1, (total_results - 1) // RESULTS_PER_PAGE + 1)
 page = st.number_input(f"Page (1 – {total_pages})", min_value=1, max_value=total_pages, value=1, step=1)
 
@@ -458,8 +502,85 @@ start = (page - 1) * RESULTS_PER_PAGE
 end = start + RESULTS_PER_PAGE
 page_results = results.iloc[start:end]
 
-for _, row in page_results.iterrows():
-    st.markdown(render_card(row, query), unsafe_allow_html=True)
+# ============================================================
+# Render results
+# ============================================================
+for idx, row in page_results.iterrows():
+    is_post = row.get("type") == "post"
+    badge = (
+        '<span class="badge-post">POST</span>'
+        if is_post
+        else '<span class="badge-comment">COMMENT</span>'
+    )
+    author = escape_html(row.get("author", "unknown"))
+    score = int(row.get("score", 0) or 0)
+    date_str = format_date(row.get("created_utc", 0))
+    post_id = str(row.get("id", ""))
+    reddit_link = f"https://reddit.com/comments/{post_id}" if post_id else ""
+
+    title_raw = str(row.get("title", "")).strip()
+    body_raw = str(row.get("body", "")).strip()
+
+    # Parent post reference for comments
+    parent_html = ""
+    if not is_post and row.get("link_id"):
+        parent_id = str(row["link_id"]).replace("t3_", "")
+        parent_html = f'<div class="parent-ref">↳ in reply to post {parent_id}</div>'
+
+    # Card header
+    meta = f"""
+    <div class="result-meta">
+        {badge}
+        <span>by <span class="author">u/{author}</span></span>
+        <span>· {date_str}</span>
+        <span>· <span class="upvotes">▲ {score}</span></span>
+    </div>
+    """
+
+    title_html = ""
+    if title_raw:
+        title_html = f'<div class="result-title">{highlight(linkify(escape_html(title_raw)), query)}</div>'
+
+    # Short preview body
+    preview = truncate(body_raw, MAX_BODY_PREVIEW)
+    body_html = f'<div class="result-body">{highlight(linkify(escape_html(preview)), query)}</div>' if preview else ""
+
+    # Render the visible card
+    st.markdown(f"""
+    <div class="result-card">
+        {meta}
+        {parent_html}
+        {title_html}
+        {body_html}
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Action row
+    action_cols = st.columns([1, 1, 1, 3])
+
+    # Show full text in expander
+    if len(body_raw) > MAX_BODY_PREVIEW:
+        with action_cols[0]:
+            with st.expander("Show full text"):
+                st.markdown(
+                    f'<div class="result-body">{highlight(linkify(escape_html(body_raw)), query)}</div>',
+                    unsafe_allow_html=True,
+                )
+
+    # Reddit link
+    if reddit_link:
+        with action_cols[1]:
+            st.markdown(f"[🔗 Reddit]({reddit_link})")
+
+    # Copy button
+    with action_cols[2]:
+        if st.button("📋 Copy", key=f"copy_{idx}"):
+            st.session_state[f"copied_{idx}"] = True
+            st.toast("Copied to clipboard!", icon="✅")
+
+    # Show copied confirmation
+    if st.session_state.get(f"copied_{idx}"):
+        st.code(body_raw, language=None)
 
 st.markdown(
     """
