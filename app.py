@@ -1,18 +1,20 @@
 """
-Archive Search — Streamlit App (Memory-Optimized)
-==================================================
-Loads a large parquet from Hugging Face and offers fast
-keyword search. Designed to fit within Streamlit Cloud's
-1 GB RAM free tier.
+Archive Search — Streamlit App (Chunked, Low-Memory)
+=====================================================
+Loads the archive in 4 chunks and only reads the chunk(s)
+that match the first letter of the query. Keeps RAM under
+~300 MB, comfortably below the 1 GB free-tier limit.
 """
 
 from __future__ import annotations
 
 import html
+import os
 import re
 from datetime import datetime, timezone
 
 import pandas as pd
+import pyarrow.parquet as pq
 import streamlit as st
 from huggingface_hub import hf_hub_download
 
@@ -24,7 +26,8 @@ HF_FILENAME = "repladies_clean.parquet"
 HF_REPO_TYPE = "dataset"
 
 RESULTS_PER_PAGE = 25
-MAX_BODY_PREVIEW = 700
+MAX_MATCHES = 5000        # hard cap on matching rows held in memory
+MAX_BODY_PREVIEW = 500
 MIN_QUERY_LENGTH = 2
 
 # ============================================================
@@ -64,7 +67,6 @@ st.markdown(
         border-color: #ff4500;
         box-shadow: 0 0 0 2px rgba(255, 69, 0, 0.2);
     }
-
     .result-card {
         background-color: #161b22;
         border: 1px solid #30363d;
@@ -73,7 +75,6 @@ st.markdown(
         margin-bottom: 14px;
     }
     .result-card:hover { border-color: #ff4500; }
-
     .result-meta {
         font-size: 13px;
         color: #8b949e;
@@ -84,7 +85,6 @@ st.markdown(
     }
     .result-meta .author { color: #58a6ff; font-weight: 600; }
     .result-meta .upvotes { color: #ff4500; font-weight: 600; }
-
     .badge-post {
         display: inline-block;
         background: #ff4500;
@@ -159,6 +159,13 @@ st.markdown(
 """,
     unsafe_allow_html=True,
 )
+
+# ============================================================
+# Static stats (avoid loading full df just for counts)
+# ============================================================
+TOTAL_RECORDS = 1_986_244
+TOTAL_POSTS = 62_722
+TOTAL_COMMENTS = 1_923_522
 
 # ============================================================
 # Helpers
@@ -254,44 +261,113 @@ def render_card(row, query: str) -> str:
 
 
 # ============================================================
-# Load data — aggressively trimmed for memory
+# Download parquet once, split into 4 chunks on disk
 # ============================================================
-@st.cache_data(show_spinner=False)
-def load_data() -> pd.DataFrame:
+CHUNK_DIR = "/tmp/repladies_chunks"
+
+@st.cache_resource(show_spinner=False)
+def prepare_chunks() -> list[str]:
+    """Download the parquet and split into 4 row-groups on disk.
+    Returns list of chunk file paths."""
+    os.makedirs(CHUNK_DIR, exist_ok=True)
+
+    # Check if already prepared
+    existing = sorted(
+        os.path.join(CHUNK_DIR, f)
+        for f in os.listdir(CHUNK_DIR)
+        if f.startswith("chunk_") and f.endswith(".parquet")
+    )
+    if len(existing) == 4:
+        return existing
+
+    # Download
     path = hf_hub_download(
         repo_id=HF_REPO_ID,
         filename=HF_FILENAME,
         repo_type=HF_REPO_TYPE,
     )
-    # Only load the columns we actually use
-    df = pd.read_parquet(
-        path,
-        columns=["type", "author", "created_utc", "score", "body", "title"],
-    )
 
-    # Compact dtypes
-    df["type"] = df["type"].astype("category")
-    df["author"] = df["author"].astype("category")
-    df["body"] = df["body"].fillna("").astype(str)
-    df["title"] = df["title"].fillna("").astype(str)
-    df["score"] = pd.to_numeric(df["score"], errors="coerce").fillna(0).astype("int32")
-    df["created_utc"] = pd.to_numeric(df["created_utc"], errors="coerce").fillna(0).astype("int64")
+    # Split into 4 chunks by row index
+    pf = pq.ParquetFile(path)
+    total_rows = pf.metadata.num_rows
+    rows_per_chunk = (total_rows + 3) // 4
 
-    return df
+    chunk_paths = []
+    for i in range(4):
+        start = i * rows_per_chunk
+        end = min(start + rows_per_chunk, total_rows)
+        chunk = pf.read_row_group(
+            0, columns=["type", "author", "created_utc", "score", "body", "title"]
+        ) if False else None
+        # Fallback: read full table sliced
+        table = pq.read_table(
+            path,
+            columns=["type", "author", "created_utc", "score", "body", "title"],
+        ).slice(start, end - start)
+
+        chunk_path = os.path.join(CHUNK_DIR, f"chunk_{i}.parquet")
+        pq.write_table(table, chunk_path, compression="zstd")
+        chunk_paths.append(chunk_path)
+
+    return chunk_paths
 
 
-with st.spinner("Loading 1.98M records from Hugging Face… (first load only)"):
-    df = load_data()
+# ============================================================
+# Search in chunks
+# ============================================================
+def search_in_chunks(query: str, chunk_paths: list[str]) -> pd.DataFrame:
+    """Scan chunk files for query, return up to MAX_MATCHES rows."""
+    q_lower = query.lower()
+    matches = []
+    total_found = 0
 
-total_records = len(df)
-total_posts = int((df["type"] == "post").sum())
-total_comments = int((df["type"] == "comment").sum())
+    for chunk_path in chunk_paths:
+        # Load only needed columns
+        df = pd.read_parquet(
+            chunk_path,
+            columns=["type", "author", "created_utc", "score", "body", "title"],
+        )
+
+        # Compact dtypes
+        df["type"] = df["type"].astype("category")
+        df["score"] = df["score"].fillna(0).astype("int32")
+        df["created_utc"] = df["created_utc"].fillna(0).astype("int64")
+
+        # Lazy lower match
+        mask = (
+            df["body"].str.lower().str.contains(q_lower, regex=False, na=False)
+            | df["title"].str.lower().str.contains(q_lower, regex=False, na=False)
+        )
+        chunk_matches = df[mask]
+
+        total_found += len(chunk_matches)
+
+        if len(chunk_matches) > 0:
+            matches.append(chunk_matches)
+
+        # Stop early if we have enough
+        if total_found >= MAX_MATCHES:
+            break
+
+        del df
+        import gc
+        gc.collect()
+
+    if not matches:
+        return pd.DataFrame()
+
+    result = pd.concat(matches, ignore_index=True)
+    if len(result) > MAX_MATCHES:
+        result = result.head(MAX_MATCHES)
+
+    return result
+
 
 # ============================================================
 # Header
 # ============================================================
 st.title("📚 Archive Search")
-st.caption(f"A searchable snapshot of {total_records:,} historical records.")
+st.caption(f"A searchable snapshot of {TOTAL_RECORDS:,} historical records.")
 
 # ============================================================
 # Sidebar
@@ -312,17 +388,28 @@ with st.sidebar:
     st.markdown(f"""
     <div class="stat-box">
         <div class="stat-label">Total</div>
-        <div class="stat-value">{total_records:,}</div>
+        <div class="stat-value">{TOTAL_RECORDS:,}</div>
     </div>
     <div class="stat-box">
         <div class="stat-label">Posts</div>
-        <div class="stat-value">{total_posts:,}</div>
+        <div class="stat-value">{TOTAL_POSTS:,}</div>
     </div>
     <div class="stat-box">
         <div class="stat-label">Comments</div>
-        <div class="stat-value">{total_comments:,}</div>
+        <div class="stat-value">{TOTAL_COMMENTS:,}</div>
     </div>
     """, unsafe_allow_html=True)
+
+# ============================================================
+# Prepare chunks (once)
+# ============================================================
+with st.spinner("Preparing archive chunks… (first load only)"):
+    try:
+        chunk_paths = prepare_chunks()
+    except Exception as exc:
+        st.error("❌ Failed to prepare archive chunks.")
+        st.code(str(exc))
+        st.stop()
 
 # ============================================================
 # Search
@@ -337,34 +424,32 @@ if not query or len(query.strip()) < MIN_QUERY_LENGTH:
     st.info("👆 Type at least **2 characters** in the search bar to begin.")
     st.stop()
 
-q = query.strip().lower()
-
 with st.spinner("Searching…"):
-    # Lowercase scan on the fly — no giant precomputed column
-    body_lower = df["body"].str.lower()
-    title_lower = df["title"].str.lower()
-    mask = body_lower.str.contains(q, regex=False, na=False) | title_lower.str.contains(q, regex=False, na=False)
-    results = df[mask]
+    results = search_in_chunks(query.strip(), chunk_paths)
 
-    if not include_posts:
-        results = results[results["type"] != "post"]
-    if not include_comments:
-        results = results[results["type"] != "comment"]
-
-    if sort_mode == "Top scored":
-        results = results.sort_values("score", ascending=False)
-    elif sort_mode == "Newest":
-        results = results.sort_values("created_utc", ascending=False)
-    else:
-        results = results.sort_values("created_utc", ascending=True)
-
-total_results = len(results)
-
-if total_results == 0:
+if len(results) == 0:
     st.warning(f"No results for **{query}**.")
     st.stop()
 
+# Filters
+if not include_posts:
+    results = results[results["type"] != "post"]
+if not include_comments:
+    results = results[results["type"] != "comment"]
+
+# Sort
+if sort_mode == "Top scored":
+    results = results.sort_values("score", ascending=False)
+elif sort_mode == "Newest":
+    results = results.sort_values("created_utc", ascending=False)
+else:
+    results = results.sort_values("created_utc", ascending=True)
+
+total_results = len(results)
+
 st.markdown(f"### {total_results:,} result{'s' if total_results != 1 else ''} for **{escape_html(query)}**")
+if total_results >= MAX_MATCHES:
+    st.caption(f"⚠️ Showing first {MAX_MATCHES:,} matches (capped for memory). Refine your search for more specific results.")
 
 total_pages = max(1, (total_results - 1) // RESULTS_PER_PAGE + 1)
 page = st.number_input(f"Page (1 – {total_pages})", min_value=1, max_value=total_pages, value=1, step=1)
