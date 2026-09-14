@@ -1,512 +1,482 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Archive Search</title>
-<meta name="description" content="Search 1.9M+ historical records" />
+"""
+Archive Search — Streamlit App
+===============================
+A high-performance search interface for a large historical dataset
+hosted on Hugging Face. Loads once into memory, then answers
+queries instantly with relevance scoring, filters, sorting,
+pagination, and CSV export.
+"""
 
-<script src="https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.28.0/dist/duckdb-browser.mjs" type="module"></script>
-<script src="https://cdn.tailwindcss.com"></script>
+from __future__ import annotations
 
-<script>
-  tailwind.config = {
-    theme: {
-      extend: {
-        colors: {
-          bg: '#0d1117',
-          panel: '#161b22',
-          border: '#30363d',
-          text: '#e6edf3',
-          muted: '#8b949e',
-          accent: '#ff4500',
-          link: '#58a6ff',
-        },
-      },
-    },
-  };
-</script>
+import html
+import re
+from datetime import datetime, timezone
 
+import pandas as pd
+import streamlit as st
+from huggingface_hub import hf_hub_download
+
+# ============================================================
+# Configuration
+# ============================================================
+HF_REPO_ID = "just3nu/RepLadies_Archive"
+HF_FILENAME = "repladies_clean.parquet"
+HF_REPO_TYPE = "dataset"
+
+RESULTS_PER_PAGE = 25
+MAX_BODY_PREVIEW = 700
+MIN_QUERY_LENGTH = 2
+
+# ============================================================
+# Page config
+# ============================================================
+st.set_page_config(
+    page_title="Archive Search",
+    page_icon="📚",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ============================================================
+# Custom CSS — dark theme
+# ============================================================
+st.markdown(
+    """
 <style>
-  body { background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
-  mark { background: #ff4500; color: white; padding: 1px 3px; border-radius: 3px; }
-  .result-card { transition: border-color 0.15s ease, transform 0.15s ease; }
-  .result-card:hover { border-color: #ff4500; transform: translateY(-1px); }
-  .result-body { word-wrap: break-word; overflow-wrap: anywhere; }
-  .result-body a, .result-title a { color: #58a6ff; text-decoration: none; border-bottom: 1px dotted #58a6ff; }
-  .result-body a:hover { color: #79c0ff; border-bottom-color: #79c0ff; }
-  .skeleton { background: linear-gradient(90deg, #161b22 25%, #21262d 50%, #161b22 75%); background-size: 200% 100%; animation: shimmer 1.4s infinite; }
-  @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
-  ::-webkit-scrollbar { width: 10px; height: 10px; }
-  ::-webkit-scrollbar-track { background: #0d1117; }
-  ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 5px; }
-  ::-webkit-scrollbar-thumb:hover { background: #ff4500; }
+    .stApp { background-color: #0d1117; color: #e6edf3; }
+    section[data-testid="stSidebar"] {
+        background-color: #161b22;
+        border-right: 1px solid #30363d;
+    }
+    h1, h2, h3 { color: #ff4500 !important; letter-spacing: -0.02em; }
+    h1 { font-weight: 800; }
+    p, li, span, div { color: #c9d1d9; }
+
+    .stTextInput > div > div > input {
+        background-color: #161b22;
+        color: #e6edf3;
+        border: 1px solid #30363d;
+        border-radius: 10px;
+        font-size: 16px;
+        padding: 12px 14px;
+    }
+    .stTextInput > div > div > input:focus {
+        border-color: #ff4500;
+        box-shadow: 0 0 0 2px rgba(255, 69, 0, 0.2);
+    }
+
+    .result-card {
+        background-color: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 10px;
+        padding: 16px 18px;
+        margin-bottom: 14px;
+        transition: border-color 0.15s ease, transform 0.15s ease;
+    }
+    .result-card:hover {
+        border-color: #ff4500;
+        transform: translateY(-1px);
+    }
+    .result-meta {
+        font-size: 13px;
+        color: #8b949e;
+        margin-bottom: 8px;
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+    .result-meta .author { color: #58a6ff; font-weight: 600; }
+    .result-meta .upvotes { color: #ff4500; font-weight: 600; }
+    .badge-post {
+        display: inline-block;
+        background: #ff4500;
+        color: #ffffff;
+        font-size: 11px;
+        font-weight: 700;
+        padding: 3px 9px;
+        border-radius: 5px;
+        letter-spacing: 0.5px;
+    }
+    .badge-comment {
+        display: inline-block;
+        background: #30363d;
+        color: #c9d1d9;
+        font-size: 11px;
+        font-weight: 700;
+        padding: 3px 9px;
+        border-radius: 5px;
+        letter-spacing: 0.5px;
+    }
+    .result-title {
+        font-size: 18px;
+        font-weight: 700;
+        color: #e6edf3;
+        margin: 6px 0 8px 0;
+        line-height: 1.35;
+    }
+    .result-body {
+        font-size: 15px;
+        line-height: 1.6;
+        color: #c9d1d9;
+        word-wrap: break-word;
+        overflow-wrap: anywhere;
+        white-space: pre-wrap;
+    }
+    .result-body a, .result-title a {
+        color: #58a6ff;
+        text-decoration: none;
+        border-bottom: 1px dotted #58a6ff;
+    }
+    .result-body a:hover, .result-title a:hover { color: #79c0ff; }
+    mark {
+        background: #ff4500;
+        color: #fff;
+        padding: 1px 4px;
+        border-radius: 3px;
+        font-weight: 600;
+    }
+    .footer {
+        color: #6e7681;
+        font-size: 12px;
+        text-align: center;
+        margin-top: 40px;
+        padding-top: 20px;
+        border-top: 1px solid #30363d;
+    }
+    .stat-box {
+        background: #0d1117;
+        border: 1px solid #30363d;
+        border-radius: 8px;
+        padding: 10px 12px;
+        margin-bottom: 8px;
+    }
+    .stat-label {
+        font-size: 11px;
+        color: #8b949e;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+    .stat-value {
+        font-size: 18px;
+        color: #ff4500;
+        font-weight: 700;
+    }
+    .chip {
+        display: inline-block;
+        background: #161b22;
+        border: 1px solid #30363d;
+        color: #c9d1d9;
+        border-radius: 999px;
+        padding: 4px 12px;
+        font-size: 13px;
+        margin: 2px;
+    }
 </style>
-</head>
+""",
+    unsafe_allow_html=True,
+)
 
-<body class="min-h-screen">
+# ============================================================
+# Helpers
+# ============================================================
+def escape_html(text: str) -> str:
+    return html.escape(str(text or ""))
 
-<!-- Header -->
-<header class="border-b border-border bg-panel">
-  <div class="max-w-6xl mx-auto px-6 py-5 flex items-center justify-between">
-    <div class="flex items-center gap-3">
-      <div class="w-10 h-10 rounded-lg bg-accent flex items-center justify-center text-white font-bold text-lg">A</div>
-      <div>
-        <h1 class="text-xl font-bold text-accent">Archive Search</h1>
-        <p class="text-xs text-muted" id="header-stats">Loading…</p>
-      </div>
+
+URL_REGEX = re.compile(r"(https?://[^\s<>\"')\]]+)", re.IGNORECASE)
+
+
+def linkify(escaped_text: str) -> str:
+    """Turn bare URLs into clickable links (already-escaped input)."""
+
+    def repl(match: re.Match) -> str:
+        url = match.group(1)
+        trailing = ""
+        while url and url[-1] in ".,;:!?)":
+            trailing = url[-1] + trailing
+            url = url[:-1]
+        return (
+            f'<a href="{url}" target="_blank" rel="noopener noreferrer">'
+            f"{url}</a>{trailing}"
+        )
+
+    return URL_REGEX.sub(repl, escaped_text)
+
+
+def highlight(escaped_text: str, query: str) -> str:
+    """Highlight query terms in already-escaped text (skips inside tags)."""
+    terms = [t for t in re.split(r"\s+", query.strip()) if len(t) >= 2]
+    if not terms:
+        return escaped_text
+
+    parts = re.split(r"(<[^>]+>)", escaped_text)
+    for i, part in enumerate(parts):
+        if part.startswith("<"):
+            continue
+        for term in terms:
+            part = re.sub(
+                re.escape(term),
+                lambda m: f"<mark>{m.group(0)}</mark>",
+                part,
+                flags=re.IGNORECASE,
+            )
+        parts[i] = part
+    return "".join(parts)
+
+
+def format_date(ts) -> str:
+    try:
+        n = int(ts)
+        if n <= 0:
+            return "unknown"
+        return datetime.fromtimestamp(n, tz=timezone.utc).strftime("%b %d, %Y")
+    except Exception:
+        return "unknown"
+
+
+def truncate(text: str, limit: int = MAX_BODY_PREVIEW) -> str:
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0] + "…"
+
+
+def render_card(row: pd.Series, query: str) -> str:
+    is_post = row.get("type") == "post"
+    badge = (
+        '<span class="badge-post">POST</span>'
+        if is_post
+        else '<span class="badge-comment">COMMENT</span>'
+    )
+
+    author = escape_html(row.get("author", "unknown"))
+    score = int(row.get("score", 0) or 0)
+    date_str = format_date(row.get("created_utc", 0))
+
+    title_raw = str(row.get("title", "")).strip()
+    title_html = ""
+    if title_raw:
+        t = highlight(linkify(escape_html(title_raw)), query)
+        title_html = f'<div class="result-title">{t}</div>'
+
+    body_raw = truncate(str(row.get("body", "")).strip())
+    body_html = ""
+    if body_raw:
+        b = highlight(linkify(escape_html(body_raw)), query)
+        body_html = f'<div class="result-body">{b}</div>'
+
+    return f"""
+    <div class="result-card">
+        <div class="result-meta">
+            {badge}
+            <span>by <span class="author">u/{author}</span></span>
+            <span>· {date_str}</span>
+            <span>· <span class="upvotes">▲ {score}</span></span>
+        </div>
+        {title_html}
+        {body_html}
     </div>
-    <div class="hidden md:flex items-center gap-2 text-xs text-muted">
-      <span class="px-2 py-1 rounded bg-bg border border-border">DuckDB-WASM</span>
-      <span class="px-2 py-1 rounded bg-bg border border-border">1.9M records</span>
+    """
+
+
+# ============================================================
+# Data loading (cached)
+# ============================================================
+@st.cache_data(show_spinner=False)
+def load_data() -> pd.DataFrame:
+    """Download and cache the parquet dataset from Hugging Face."""
+    path = hf_hub_download(
+        repo_id=HF_REPO_ID,
+        filename=HF_FILENAME,
+        repo_type=HF_REPO_TYPE,
+    )
+    df = pd.read_parquet(path)
+
+    # Normalize column types
+    df["body"] = df["body"].fillna("").astype(str)
+    df["title"] = df["title"].fillna("").astype(str)
+    df["author"] = df["author"].fillna("unknown").astype(str)
+    df["score"] = pd.to_numeric(df["score"], errors="coerce").fillna(0).astype(int)
+    df["created_utc"] = pd.to_numeric(df["created_utc"], errors="coerce").fillna(0).astype(int)
+
+    # Precompute lowercase search blob
+    df["_search"] = (df["body"] + " " + df["title"]).str.lower()
+
+    return df
+
+
+# ============================================================
+# Load
+# ============================================================
+try:
+    with st.spinner("Loading 1.98M records from Hugging Face… (this happens once)"):
+        df = load_data()
+except Exception as exc:
+    st.error("❌ Failed to load the dataset from Hugging Face.")
+    st.code(str(exc))
+    st.stop()
+
+total_records = len(df)
+total_posts = int((df["type"] == "post").sum())
+total_comments = int((df["type"] == "comment").sum())
+
+# ============================================================
+# Header
+# ============================================================
+st.title("📚 Archive Search")
+st.caption(f"A searchable snapshot of {total_records:,} historical records.")
+
+# ============================================================
+# Sidebar
+# ============================================================
+with st.sidebar:
+    st.markdown("### 🎛️ Filters")
+
+    include_posts = st.checkbox("Include posts", value=True)
+    include_comments = st.checkbox("Include comments", value=True)
+
+    sort_mode = st.radio(
+        "Sort by",
+        ["Top scored", "Newest", "Oldest", "Relevance"],
+        index=0,
+    )
+
+    min_score = st.slider("Minimum score", 0, 500, 0, step=5)
+
+    st.markdown("---")
+    st.markdown("### 📈 Archive Stats")
+
+    st.markdown(
+        f"""
+        <div class="stat-box">
+            <div class="stat-label">Total records</div>
+            <div class="stat-value">{total_records:,}</div>
+        </div>
+        <div class="stat-box">
+            <div class="stat-label">Posts</div>
+            <div class="stat-value">{total_posts:,}</div>
+        </div>
+        <div class="stat-box">
+            <div class="stat-label">Comments</div>
+            <div class="stat-value">{total_comments:,}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# ============================================================
+# Search input
+# ============================================================
+query = st.text_input(
+    "🔍 Search the archive",
+    placeholder="Try: zimmermann, birkin, taobao, chanel…",
+    label_visibility="collapsed",
+)
+
+if not query or len(query.strip()) < MIN_QUERY_LENGTH:
+    st.info("👆 Type at least **2 characters** in the search bar to begin.")
+
+    st.markdown("**Popular searches to try:**")
+    st.markdown(
+        """
+        <span class="chip">zimmermann</span>
+        <span class="chip">birkin</span>
+        <span class="chip">taobao</span>
+        <span class="chip">chanel 19</span>
+        <span class="chip">yupoo</span>
+        <span class="chip">weidian</span>
+        <span class="chip">hermes</span>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.stop()
+
+# ============================================================
+# Search + filter + sort
+# ============================================================
+q = query.strip().lower()
+
+with st.spinner("Searching…"):
+    mask = df["_search"].str.contains(q, regex=False, na=False)
+    results = df[mask]
+
+    if not include_posts:
+        results = results[results["type"] != "post"]
+    if not include_comments:
+        results = results[results["type"] != "comment"]
+    if min_score > 0:
+        results = results[results["score"] >= min_score]
+
+    if sort_mode == "Top scored":
+        results = results.sort_values("score", ascending=False)
+    elif sort_mode == "Newest":
+        results = results.sort_values("created_utc", ascending=False)
+    elif sort_mode == "Oldest":
+        results = results.sort_values("created_utc", ascending=True)
+    else:  # Relevance — approximate: high score first, recent tie-break
+        results = results.sort_values(["score", "created_utc"], ascending=[False, False])
+
+total_results = len(results)
+
+if total_results == 0:
+    st.warning(f"No results for **{query}**.")
+    st.caption("Try a shorter keyword, or widen your filters in the sidebar.")
+    st.stop()
+
+# ============================================================
+# Header row + CSV download
+# ============================================================
+col_left, col_right = st.columns([3, 1])
+with col_left:
+    st.markdown(
+        f"### {total_results:,} result"
+        f"{'s' if total_results != 1 else ''} for **{escape_html(query)}**"
+    )
+with col_right:
+    csv_bytes = results.head(1000).to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "⬇️ Download first 1,000 (CSV)",
+        data=csv_bytes,
+        file_name=f"archive_{re.sub(r'[^a-zA-Z0-9]+', '_', query)[:40]}.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+# ============================================================
+# Pagination
+# ============================================================
+total_pages = max(1, (total_results - 1) // RESULTS_PER_PAGE + 1)
+
+page = st.number_input(
+    f"Page (1 – {total_pages})",
+    min_value=1,
+    max_value=total_pages,
+    value=1,
+    step=1,
+    help="Use the arrows to move through pages.",
+)
+
+start = (page - 1) * RESULTS_PER_PAGE
+end = start + RESULTS_PER_PAGE
+page_results = results.iloc[start:end]
+
+# ============================================================
+# Render results
+# ============================================================
+for _, row in page_results.iterrows():
+    st.markdown(render_card(row, query), unsafe_allow_html=True)
+
+# ============================================================
+# Footer
+# ============================================================
+st.markdown(
+    """
+    <div class="footer">
+        Archive Search · Historical data preserved for research purposes
     </div>
-  </div>
-</header>
-
-<!-- Main -->
-<main class="max-w-6xl mx-auto px-6 py-8">
-
-  <!-- Search -->
-  <div class="mb-6">
-    <div class="relative">
-      <input
-        id="search-input"
-        type="text"
-        placeholder="Search the archive…  (try: zimmermann, birkin, taobao)"
-        class="w-full bg-panel border border-border rounded-lg px-12 py-4 text-lg text-text placeholder-muted focus:outline-none focus:border-accent focus:ring-2 focus:ring-accent/20 transition"
-        autocomplete="off"
-      />
-      <svg class="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-muted" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
-      </svg>
-      <button id="clear-btn" class="hidden absolute right-4 top-1/2 -translate-y-1/2 text-muted hover:text-accent transition">
-        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
-        </svg>
-      </button>
-    </div>
-  </div>
-
-  <!-- Controls -->
-  <div class="flex flex-wrap items-center gap-3 mb-6">
-    <label class="flex items-center gap-2 text-sm text-muted cursor-pointer">
-      <input type="checkbox" id="filter-posts" checked class="accent-accent" />
-      Posts
-    </label>
-    <label class="flex items-center gap-2 text-sm text-muted cursor-pointer">
-      <input type="checkbox" id="filter-comments" checked class="accent-accent" />
-      Comments
-    </label>
-    <select id="sort-select" class="bg-panel border border-border text-text text-sm rounded-lg px-3 py-2 focus:outline-none focus:border-accent">
-      <option value="relevance">Sort: Relevance</option>
-      <option value="newest" selected>Sort: Newest</option>
-      <option value="top">Sort: Top scored</option>
-    </select>
-    <button id="download-btn" class="hidden bg-panel border border-border text-text text-sm rounded-lg px-3 py-2 hover:border-accent transition">
-      ⬇ Download CSV
-    </button>
-  </div>
-
-  <!-- Status -->
-  <div id="status" class="text-sm text-muted mb-4">Initializing search engine…</div>
-
-  <!-- Results -->
-  <div id="results"></div>
-
-  <!-- Pagination -->
-  <div id="pagination" class="hidden justify-center items-center gap-2 mt-8"></div>
-
-</main>
-
-<footer class="border-t border-border mt-12 py-6 text-center text-xs text-muted">
-  Archive Search · Historical data preserved for research purposes
-</footer>
-
-<script type="module">
-import * as duckdb from 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.28.0/dist/duckdb-browser.mjs';
-
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
-const PARQUET_URL = "https://huggingface.co/datasets/just3nu/RepLadies_Archive/resolve/main/repladies_clean.parquet";
-const RESULTS_PER_PAGE = 25;
-const DEBOUNCE_MS = 300;
-
-// ---------------------------------------------------------------------------
-// State
-// ---------------------------------------------------------------------------
-let db = null;
-let conn = null;
-let currentQuery = "";
-let currentPage = 1;
-let currentResults = [];
-let totalResults = 0;
-let isSearching = false;
-
-// ---------------------------------------------------------------------------
-// DOM
-// ---------------------------------------------------------------------------
-const $ = (id) => document.getElementById(id);
-const searchInput = $("search-input");
-const clearBtn = $("clear-btn");
-const statusEl = $("status");
-const resultsEl = $("results");
-const paginationEl = $("pagination");
-const filterPosts = $("filter-posts");
-const filterComments = $("filter-comments");
-const sortSelect = $("sort-select");
-const downloadBtn = $("download-btn");
-const headerStats = $("header-stats");
-
-// ---------------------------------------------------------------------------
-// Init DuckDB
-// ---------------------------------------------------------------------------
-async function initDuckDB() {
-  try {
-    statusEl.textContent = "Loading DuckDB engine…";
-
-    const JSDELIVR_BUNDLES = duckdb.getJsDelivrBundles();
-    const bundle = await duckdb.selectBundle(JSDELIVR_BUNDLES);
-
-    const workerUrl = URL.createObjectURL(
-      new Blob([`importScripts("${bundle.mainWorker}");`], { type: "text/javascript" })
-    );
-    const worker = new Worker(workerUrl);
-
-    const logger = new duckdb.ConsoleLogger();
-    db = new duckdb.AsyncDuckDB(logger, worker);
-    await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
-    URL.revokeObjectURL(workerUrl);
-
-    statusEl.textContent = "Connecting to dataset…";
-    conn = await db.connect();
-
-    await conn.query(`
-      CREATE OR REPLACE VIEW archive AS
-      SELECT * FROM read_parquet('${PARQUET_URL}')
-    `);
-
-    // Get stats
-    const stats = await conn.query(`
-      SELECT
-        COUNT(*) AS total,
-        SUM(CASE WHEN type = 'post' THEN 1 ELSE 0 END) AS posts,
-        SUM(CASE WHEN type = 'comment' THEN 1 ELSE 0 END) AS comments
-      FROM archive
-    `);
-    const row = stats.toArray()[0];
-    const total = Number(row.total).toLocaleString();
-    headerStats.textContent = `${total} records · searchable`;
-    statusEl.innerHTML = `<span class="text-accent">✓</span> Ready — type a keyword to search ${total} records.`;
-
-    // Hide the initial loading state
-    resultsEl.innerHTML = emptyState();
-  } catch (err) {
-    console.error(err);
-    statusEl.innerHTML = `<span class="text-red-400">✗ Error:</span> ${err.message}`;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Search
-// ---------------------------------------------------------------------------
-let debounceTimer = null;
-searchInput.addEventListener("input", (e) => {
-  const val = e.target.value.trim();
-  clearBtn.classList.toggle("hidden", val.length === 0);
-
-  clearTimeout(debounceTimer);
-  if (val.length < 2) {
-    currentResults = [];
-    totalResults = 0;
-    resultsEl.innerHTML = emptyState();
-    paginationEl.classList.add("hidden");
-    statusEl.textContent = "Type at least 2 characters.";
-    downloadBtn.classList.add("hidden");
-    return;
-  }
-  debounceTimer = setTimeout(() => performSearch(val), DEBOUNCE_MS);
-});
-
-clearBtn.addEventListener("click", () => {
-  searchInput.value = "";
-  clearBtn.classList.add("hidden");
-  resultsEl.innerHTML = emptyState();
-  paginationEl.classList.add("hidden");
-  downloadBtn.classList.add("hidden");
-  statusEl.textContent = "Type a keyword to search.";
-});
-
-[filterPosts, filterComments, sortSelect].forEach((el) =>
-  el.addEventListener("change", () => {
-    if (currentQuery) performSearch(currentQuery);
-  })
-);
-
-async function performSearch(query) {
-  if (isSearching) return;
-  isSearching = true;
-  currentQuery = query;
-  currentPage = 1;
-
-  statusEl.innerHTML = `<span class="text-accent">⏳</span> Searching…`;
-  resultsEl.innerHTML = skeletons(5);
-  paginationEl.classList.add("hidden");
-
-  try {
-    const escaped = query.replace(/'/g, "''").toLowerCase();
-    const filters = [];
-
-    if (!filterPosts.checked) filters.push("type != 'post'");
-    if (!filterComments.checked) filters.push("type != 'comment'");
-
-    const filterClause = filters.length ? `AND ${filters.join(" AND ")}` : "";
-
-    let orderBy = "created_utc DESC";
-    if (sortSelect.value === "top") orderBy = "score DESC";
-    if (sortSelect.value === "relevance") orderBy = "score DESC";
-
-    // Count
-    const countRes = await conn.query(`
-      SELECT COUNT(*) AS c FROM archive
-      WHERE (LOWER(body) LIKE '%${escaped}%' OR LOWER(title) LIKE '%${escaped}%')
-      ${filterClause}
-    `);
-    totalResults = Number(countRes.toArray()[0].c);
-
-    if (totalResults === 0) {
-      statusEl.innerHTML = `<span class="text-yellow-400">⚠</span> No results for "<b>${escapeHtml(query)}</b>".`;
-      resultsEl.innerHTML = "";
-      downloadBtn.classList.add("hidden");
-      isSearching = false;
-      return;
-    }
-
-    // Fetch first page
-    const results = await conn.query(`
-      SELECT id, type, author, created_utc, score, body, title
-      FROM archive
-      WHERE (LOWER(body) LIKE '%${escaped}%' OR LOWER(title) LIKE '%${escaped}%')
-      ${filterClause}
-      ORDER BY ${orderBy}
-      LIMIT ${RESULTS_PER_PAGE}
-    `);
-    currentResults = results.toArray();
-
-    statusEl.innerHTML = `<span class="text-accent">✓</span> <b>${totalResults.toLocaleString()}</b> result${totalResults === 1 ? "" : "s"} for "<b>${escapeHtml(query)}</b>"`;
-    renderResults(currentResults, query);
-    renderPagination();
-    downloadBtn.classList.remove("hidden");
-  } catch (err) {
-    console.error(err);
-    statusEl.innerHTML = `<span class="text-red-400">✗ Search error:</span> ${err.message}`;
-    resultsEl.innerHTML = "";
-  } finally {
-    isSearching = false;
-  }
-}
-
-async function goToPage(page) {
-  if (page < 1 || page === currentPage) return;
-  currentPage = page;
-  const offset = (page - 1) * RESULTS_PER_PAGE;
-  const escaped = currentQuery.replace(/'/g, "''").toLowerCase();
-  const filters = [];
-  if (!filterPosts.checked) filters.push("type != 'post'");
-  if (!filterComments.checked) filters.push("type != 'comment'");
-  const filterClause = filters.length ? `AND ${filters.join(" AND ")}` : "";
-  let orderBy = "created_utc DESC";
-  if (sortSelect.value === "top") orderBy = "score DESC";
-
-  resultsEl.innerHTML = skeletons(5);
-  window.scrollTo({ top: 0, behavior: "smooth" });
-
-  const results = await conn.query(`
-    SELECT id, type, author, created_utc, score, body, title
-    FROM archive
-    WHERE (LOWER(body) LIKE '%${escaped}%' OR LOWER(title) LIKE '%${escaped}%')
-    ${filterClause}
-    ORDER BY ${orderBy}
-    LIMIT ${RESULTS_PER_PAGE} OFFSET ${offset}
-  `);
-  currentResults = results.toArray();
-  renderResults(currentResults, currentQuery);
-  renderPagination();
-}
-
-// ---------------------------------------------------------------------------
-// Render
-// ---------------------------------------------------------------------------
-function emptyState() {
-  return `
-    <div class="text-center py-16">
-      <div class="text-5xl mb-4">📚</div>
-      <p class="text-muted">Type a keyword to search 1.9M+ historical records.</p>
-      <div class="mt-6 flex flex-wrap justify-center gap-2 text-sm">
-        ${["zimmermann", "birkin", "taobao", "chanel", "yupoo", "weidian"].map((t) =>
-          `<button onclick="document.getElementById('search-input').value='${t}';document.getElementById('search-input').dispatchEvent(new Event('input'))" class="bg-panel border border-border rounded-full px-3 py-1 hover:border-accent transition">${t}</button>`
-        ).join("")}
-      </div>
-    </div>
-  `;
-}
-
-function skeletons(n) {
-  return Array.from({ length: n }).map(() => `
-    <div class="result-card bg-panel border border-border rounded-lg p-4 mb-3">
-      <div class="skeleton h-3 w-40 rounded mb-3"></div>
-      <div class="skeleton h-5 w-3/4 rounded mb-3"></div>
-      <div class="skeleton h-3 w-full rounded mb-2"></div>
-      <div class="skeleton h-3 w-5/6 rounded"></div>
-    </div>
-  `).join("");
-}
-
-function renderResults(rows, query) {
-  if (!rows.length) { resultsEl.innerHTML = ""; return; }
-  resultsEl.innerHTML = rows.map((row) => renderCard(row, query)).join("");
-}
-
-function renderCard(row, query) {
-  const isPost = row.type === "post";
-  const badge = isPost
-    ? `<span class="bg-accent text-white text-xs font-bold px-2 py-0.5 rounded">POST</span>`
-    : `<span class="bg-border text-text text-xs font-bold px-2 py-0.5 rounded">COMMENT</span>`;
-
-  const date = formatDate(row.created_utc);
-  const score = Number(row.score || 0);
-  const author = escapeHtml(row.author || "unknown");
-
-  const titleHtml = row.title
-    ? `<div class="text-lg font-bold text-text mt-2 mb-2">${highlight(linkify(escapeHtml(row.title)), query)}</div>`
-    : "";
-
-  const bodyRaw = truncate(row.body || "", 700);
-  const bodyHtml = bodyRaw
-    ? `<div class="result-body text-[15px] leading-relaxed text-text">${highlight(linkify(escapeHtml(bodyRaw)), query)}</div>`
-    : "";
-
-  return `
-    <article class="result-card bg-panel border border-border rounded-lg p-4 mb-3">
-      <div class="flex flex-wrap items-center gap-2 text-xs text-muted mb-1">
-        ${badge}
-        <span>by <span class="text-link font-semibold">u/${author}</span></span>
-        <span>· ${date}</span>
-        <span>· <span class="text-accent font-semibold">▲ ${score}</span></span>
-      </div>
-      ${titleHtml}
-      ${bodyHtml}
-    </article>
-  `;
-}
-
-function renderPagination() {
-  const totalPages = Math.max(1, Math.ceil(totalResults / RESULTS_PER_PAGE));
-  if (totalPages <= 1) { paginationEl.classList.add("hidden"); return; }
-
-  const prev = currentPage > 1;
-  const next = currentPage < totalPages;
-
-  paginationEl.classList.remove("hidden");
-  paginationEl.classList.add("flex");
-  paginationEl.innerHTML = `
-    <button ${prev ? "" : "disabled"} onclick="window.__goto(${currentPage - 1})" class="px-4 py-2 rounded-lg border border-border bg-panel text-text disabled:opacity-40 disabled:cursor-not-allowed hover:border-accent transition">← Prev</button>
-    <span class="px-4 py-2 text-sm text-muted">Page <b class="text-text">${currentPage}</b> of <b class="text-text">${totalPages}</b></span>
-    <button ${next ? "" : "disabled"} onclick="window.__goto(${currentPage + 1})" class="px-4 py-2 rounded-lg border border-border bg-panel text-text disabled:opacity-40 disabled:cursor-not-allowed hover:border-accent transition">Next →</button>
-  `;
-}
-
-window.__goto = goToPage;
-
-// ---------------------------------------------------------------------------
-// CSV
-// ---------------------------------------------------------------------------
-downloadBtn.addEventListener("click", async () => {
-  if (!currentQuery) return;
-  const escaped = currentQuery.replace(/'/g, "''").toLowerCase();
-  const filters = [];
-  if (!filterPosts.checked) filters.push("type != 'post'");
-  if (!filterComments.checked) filters.push("type != 'comment'");
-  const filterClause = filters.length ? `AND ${filters.join(" AND ")}` : "";
-
-  const res = await conn.query(`
-    SELECT id, type, author, created_utc, score, title, body
-    FROM archive
-    WHERE (LOWER(body) LIKE '%${escaped}%' OR LOWER(title) LIKE '%${escaped}%')
-    ${filterClause}
-    LIMIT 1000
-  `);
-  const rows = res.toArray();
-  const header = ["id", "type", "author", "created_utc", "score", "title", "body"];
-  const csv = [
-    header.join(","),
-    ...rows.map((r) =>
-      header.map((h) => `"${String(r[h] ?? "").replace(/"/g, '""')}"`).join(",")
-    ),
-  ].join("\n");
-
-  const blob = new Blob([csv], { type: "text/csv" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `archive_${currentQuery.slice(0, 30).replace(/\s+/g, "_")}.csv`;
-  a.click();
-  URL.revokeObjectURL(url);
-});
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-function escapeHtml(text) {
-  const div = document.createElement("div");
-  div.textContent = text;
-  return div.innerHTML;
-}
-
-const URL_REGEX = /(https?:\/\/[^\s<>"')\]]+)/gi;
-function linkify(escaped) {
-  return escaped.replace(URL_REGEX, (url) => {
-    let trailing = "";
-    while (url && /[.,;:!?)]$/.test(url)) {
-      trailing = url.slice(-1) + trailing;
-      url = url.slice(0, -1);
-    }
-    return `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>${trailing}`;
-  });
-}
-
-function highlight(html, query) {
-  const terms = query.split(/\s+/).filter((t) => t.length >= 2);
-  let result = html;
-  terms.forEach((term) => {
-    const re = new RegExp(`(?<!<[^>]*)(${escapeRegex(term)})`, "gi");
-    result = result.replace(re, "<mark>$1</mark>");
-  });
-  return result;
-}
-
-function escapeRegex(s) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function formatDate(ts) {
-  try {
-    const n = Number(ts);
-    if (!n || n <= 0) return "unknown date";
-    const d = new Date(n * 1000);
-    return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
-  } catch { return "unknown date"; }
-}
-
-function truncate(text, max) {
-  if (!text) return "";
-  return text.length <= max ? text : text.slice(0, max).replace(/\s+\S*$/, "") + "…";
-}
-
-// ---------------------------------------------------------------------------
-// Boot
-// ---------------------------------------------------------------------------
-initDuckDB();
-</script>
-</body>
-</html>
+    """,
+    unsafe_allow_html=True,
+)
