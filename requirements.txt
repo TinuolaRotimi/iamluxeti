@@ -1,4 +1,4 @@
 streamlit
 pandas
 pyarrow
-huggingface_hub
+huggingface_hub<1.0
